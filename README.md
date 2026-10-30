@@ -22,6 +22,39 @@ SmartDialer implements the core components of an outbound call-center dialing sy
 - Pydantic v2
 - pytest + pytest-asyncio
 
+## Architecture & Design Decisions
+
+SmartDialer separates throughput optimization from safety invariant enforcement:
+
+```
+Campaign Manager
+    ↓
+Predictive Pacing Engine  (Calculates desired call volume)
+    ↓
+Safety Controller         (INDEPENDENT HARD CEILING: never bypassed)
+    ↓
+Call Allocator            (Atomic conditional SQL reservation)
+    ↓
+Mock Telecom Providers    (Provider A: reliable / Provider B: lag, out-of-order)
+    ↓
+Event Processor           (Two-tier idempotency: unique table + state machine)
+```
+
+### Key Architectural Invariants
+1. **Safety Controller Priority**: The predictive engine *never* dials a provider directly. Every call request must pass through the independent Safety Controller, which guarantees $\text{active\_calls} + \text{approved} \le \text{available\_agents}$.
+2. **Atomic Agent Reservation**: Prevents race conditions among workers using conditional SQL:
+   `UPDATE agents SET status='RESERVED' WHERE id=? AND status='AVAILABLE'`
+   Reservation succeeds if and only if `rowcount == 1`.
+3. **Two-Tier Idempotency**:
+   - **Tier 1**: A durable `provider_events` table with unique constraint `(event_id, provider_name)` drops duplicate webhooks before domain mutations.
+   - **Tier 2**: Forward-only state machine validation rejects regressive or out-of-order events on terminal states (`COMPLETED`, `FAILED`, `CANCELLED`).
+4. **Predictive Pacing with Zero Abandoned Calls**: Pacing computes $\lceil \text{free\_capacity} / \text{answer\_rate}\rceil$ with bounded increments and progressive fallback, while the Safety Controller maintains strict agent-bound allocation.
+5. **Worker Crash Recovery**: Lease expiration timestamps (`lease_expires_at`) allow `RecoveryService` to reclaim abandoned agents and requeue borrowers.
+
+For in-depth architectural diagrams, state machines, and scaling blueprints:
+- See [ARCHITECTURE.md](ARCHITECTURE.md) for full system diagrams, state transition graphs, and recovery flows.
+- See [ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md) for SQLite vs PostgreSQL analysis, concurrency trade-offs, and 10,000-agent scaling architecture.
+
 ## Installation
 
 ```bash
